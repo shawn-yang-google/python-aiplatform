@@ -20,7 +20,7 @@ import os
 import sys
 import tarfile
 import typing
-from typing import Optional, Protocol, Sequence, Union, List
+from typing import Optional, Protocol, Sequence, Union, List, Dict, Collection, Set, Any, Iterable
 
 from google.api_core import exceptions
 from google.cloud import storage
@@ -39,6 +39,11 @@ _DEFAULT_GCS_DIR_NAME = "reasoning_engine"
 _BLOB_FILENAME = "reasoning_engine.pkl"
 _REQUIREMENTS_FILE = "requirements.txt"
 _EXTRA_PACKAGES_FILE = "dependencies.tar.gz"
+_STANDARD_MODE = ""
+_STREAM_MODE = "stream"
+_DEFAULT_QUERY_METHOD = "query"
+_DEFAULT_STREAM_QUERY_METHOD = "stream_query"
+_GET_REGISTERED_OPERATIONS = "register_operations"
 
 
 @typing.runtime_checkable
@@ -59,7 +64,31 @@ class Cloneable(Protocol):
         """Return a clone of the object."""
 
 
-class ReasoningEngine(base.VertexAiResourceNounWithFutureManager, Queryable):
+@typing.runtime_checkable
+class StreamQueryable(Protocol):
+    """Protocol for Reasoning Engine applications that can be stream_queried."""
+
+    @abc.abstractmethod
+    def stream_query(self, **kwargs):
+        """Runs the Reasoning Engine to serve the user query."""
+
+
+@typing.runtime_checkable
+class OperationRegisterable(Protocol):
+    """Protocol for Reasoning Engine applications that has registered operations."""
+
+    @abc.abstractmethod
+    def register_operations(self, **kwargs) -> Dict[str, Collection[str]]:
+        """Register the user provided operations (modes and methods)."""
+
+
+# At least one of the above classes is implemented.
+Invocable = typing.Union[
+    Queryable, StreamQueryable, OperationRegisterable,
+]
+
+
+class ReasoningEngine(base.VertexAiResourceNounWithFutureManager, Invocable):
     """Represents a Vertex AI Reasoning Engine resource."""
 
     client_class = aip_utils.ReasoningEngineClientWithOverride
@@ -85,6 +114,14 @@ class ReasoningEngine(base.VertexAiResourceNounWithFutureManager, Queryable):
         )
         self._gca_resource = self._get_gca_resource(resource_name=reasoning_engine_name)
         self._operation_schemas = None
+
+        if isinstance(self, OperationRegisterable):
+            self._registered_methods = _to_registered_methods(
+                self.register_operations()
+            )
+            self._registered_method_modes = _to_registered_method_modes(
+                self.register_operations()
+            )
 
     @property
     def resource_name(self) -> str:
@@ -415,13 +452,20 @@ class ReasoningEngine(base.VertexAiResourceNounWithFutureManager, Queryable):
             self._operation_schemas = spec.get("class_methods", [])
         return self._operation_schemas
 
-    def query(self, **kwargs) -> _utils.JsonDict:
+    def _query(
+        self,
+        method_name: Optional[str] = _DEFAULT_QUERY_METHOD,
+        **kwargs,
+    ) -> _utils.JsonDict:
         """Runs the Reasoning Engine to serve the user query.
 
         This will be based on the `.query(...)` method of the python object that
         was passed in when creating the Reasoning Engine.
 
         Args:
+            method_name (str):
+                Optional. The name of the method to be called. If not
+                specified, the default query method will be called.
             **kwargs:
                 Optional. The arguments of the `.query(...)` method.
 
@@ -432,12 +476,72 @@ class ReasoningEngine(base.VertexAiResourceNounWithFutureManager, Queryable):
             request=types.QueryReasoningEngineRequest(
                 name=self.resource_name,
                 input=kwargs,
+                class_method=method_name
             ),
         )
         output = _utils.to_dict(response)
         if "output" in output:
             return output.get("output")
         return output
+
+    def _stream_query(self, method_name, **kwargs) -> Iterable[Any]:
+        """Runs the Reasoning Engine to serve the user streaming query.
+
+        Args:
+            method_name (str):
+                Optional. The name of the method to be called. If not
+                specified, the default stream query method will be called.
+            **kwargs:
+                Optional. The arguments of the `stream` mode's method.
+
+        Yields:
+            Any: The response from serving the user stream query.
+        """
+        response = self.execution_api_client.stream_query_reasoning_engine(
+            request=types.StreamQueryReasoningEngineRequest(
+                name=self.resource_name,
+                input=kwargs,
+                class_method=method_name
+            ),
+        )
+        for chunk in response:
+            yield chunk
+
+    def __getattr__(self, method_name: str):
+        def method(**kwargs):
+            return self._call_dynamic_method(method_name, **kwargs)
+        return method
+
+    def _call_dynamic_method(self, method_name, **kwargs):
+        if not isinstance(self, OperationRegisterable):
+            if method_name in _DEFAULT_QUERY_METHOD:
+                return self._query(_DEFAULT_QUERY_METHOD, **kwargs)
+            if method_name == _DEFAULT_STREAM_QUERY_METHOD:
+                return self._stream_query(
+                    _DEFAULT_STREAM_QUERY_METHOD, **kwargs)
+            # Any other pre-defined method.
+            return getattr(self, method_name)(**kwargs)
+
+        # Binding `registered_operations` to the fixed query endpoint.
+        if method_name == _GET_REGISTERED_OPERATIONS:
+            return self._query(_GET_REGISTERED_OPERATIONS, **kwargs)
+
+        # Any other pre-defined method.
+        if method_name not in self._registered_methods:
+            return getattr(self, method_name)(**kwargs)
+
+        # Dynamic binding the registered methods to endpoints based on mode.
+        mode = self._registered_method_modes[method_name]
+        if mode not in (_STANDARD_MODE, _STREAM_MODE):
+            raise ValueError(
+                f"The mode '{mode}' for method '{method_name}' is not "
+                f"supported. currently only {_STANDARD_MODE} and {_STREAM_MODE}"
+                "are supported."
+            )
+        if mode == _STANDARD_MODE:
+            return self._query(method_name, **kwargs)
+        if mode == _STREAM_MODE:
+            return self._stream_query(method_name, **kwargs)
 
 
 def _validate_sys_version_or_raise(sys_version: str) -> None:
@@ -670,3 +774,25 @@ def _generate_update_request_or_raise(
         reasoning_engine=reasoning_engine_message,
         update_mask=field_mask_pb2.FieldMask(paths=update_masks),
     )
+
+
+def _to_registered_methods(
+    registered_operations: Dict[str, Collection[str]]
+) -> Set[str]:
+    methods = set()
+    mode_methods = registered_operations
+    for mode in mode_methods:
+        for method in mode_methods[mode]:
+            methods.add(method)
+    return methods
+
+
+def _to_registered_method_modes(
+    registered_operations: Dict[str, Collection[str]]
+) -> Dict[str, str]:
+    method_modes = dict()
+    mode_methods = registered_operations
+    for mode in mode_methods:
+        for method in mode_methods[mode]:
+            method_modes[method] = mode
+    return method_modes

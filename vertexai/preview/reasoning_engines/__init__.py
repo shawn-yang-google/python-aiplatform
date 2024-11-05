@@ -18,6 +18,9 @@
 # pylint: disable=g-multiple-import,g-importing-member
 from vertexai.reasoning_engines._reasoning_engines import (
     Queryable,
+    StreamQueryable,
+    OperationRegisterable,
+    Invocable,
     ReasoningEngine,
 )
 from vertexai.preview.reasoning_engines.templates.langchain import (
